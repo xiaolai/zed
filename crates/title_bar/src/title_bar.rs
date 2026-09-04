@@ -48,7 +48,7 @@ use theme::ActiveTheme;
 use title_bar_settings::TitleBarSettings;
 use ui::{
     Avatar, ButtonLike, ContextMenu, ContextMenuEntry, IconWithIndicator, Indicator, PopoverMenu,
-    PopoverMenuHandle, TintColor, Tooltip, prelude::*, utils::platform_title_bar_height,
+    PopoverMenuHandle, Tab, TintColor, Tooltip, prelude::*, utils::platform_title_bar_height,
 };
 use update_version::UpdateVersion;
 use util::ResultExt;
@@ -328,6 +328,7 @@ impl Render for TitleBar {
                             },
                         )
                         .children(self.render_restricted_mode(cx))
+                        .children(self.render_workspace_tabs(window, cx))
                         .when(render_project_items, |title_bar| {
                             title_bar
                                 .when(title_bar_settings.show_project_items, |title_bar| {
@@ -742,6 +743,82 @@ impl TitleBar {
         } else {
             Some(button.into_any_element())
         }
+    }
+
+    /// Tabs for switching between the workspaces open in this window.
+    ///
+    /// These are workspace tabs, unrelated to the editor tab bar: workspaces
+    /// are per-window, so unlike editor tabs they have exactly one row here
+    /// regardless of pane splits.
+    ///
+    /// Returns None when the multi-workspace feature is off or only one
+    /// workspace is open, so a single-project window looks unchanged.
+    fn render_workspace_tabs(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let multi_workspace = self.multi_workspace.as_ref()?.upgrade()?;
+        if !multi_workspace.read(cx).multi_workspace_enabled(cx) {
+            return None;
+        }
+
+        let groups = multi_workspace.read(cx).project_groups(cx);
+        if groups.len() < 2 {
+            return None;
+        }
+
+        // Same disambiguation the sidebar uses, so two directories with the
+        // same basename get distinguishable labels.
+        let mut all_paths: Vec<std::path::PathBuf> = groups
+            .iter()
+            .flat_map(|group| group.key.path_list().paths().iter().cloned())
+            .collect();
+        all_paths.sort_unstable();
+        all_paths.dedup();
+        let path_details =
+            util::disambiguate::compute_disambiguation_details(&all_paths, |path, detail| {
+                project::path_suffix(path, detail)
+            });
+        let path_detail_map: std::collections::HashMap<std::path::PathBuf, usize> =
+            all_paths.into_iter().zip(path_details).collect();
+
+        let active_key = self
+            .workspace
+            .upgrade()
+            .map(|workspace| multi_workspace.read(cx).project_group_key_for_workspace(&workspace, cx));
+
+        let tabs = groups
+            .into_iter()
+            .filter(|group| !group.key.path_list().paths().is_empty())
+            .enumerate()
+            .map(|(ix, group)| {
+                let key = group.key.clone();
+                let label = key.display_name(&path_detail_map);
+                let is_active = active_key.as_ref() == Some(&key);
+                let multi_workspace = multi_workspace.clone();
+
+                Tab::new(("workspace-tab", ix))
+                    .toggle_state(is_active)
+                    .child(Label::new(label).size(LabelSize::Small))
+                    .on_click(move |_, window, cx| {
+                        let target = multi_workspace.read(cx).workspace_for_paths(
+                            key.path_list(),
+                            key.host().as_ref(),
+                            cx,
+                        );
+                        if let Some(workspace) = target {
+                            multi_workspace.update(cx, |multi_workspace, cx| {
+                                multi_workspace.activate(workspace, None, window, cx);
+                                multi_workspace.retain_active_workspace(cx);
+                            });
+                        }
+                    })
+            })
+            .collect::<Vec<_>>();
+
+        let _ = window;
+        Some(h_flex().gap_0p5().children(tabs).into_any_element())
     }
 
     pub fn render_project_host(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
