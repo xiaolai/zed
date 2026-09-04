@@ -947,6 +947,8 @@ impl VsCodeSettings {
                         TerminalBell::Off
                     }
                 }),
+            // VS Code has no equivalent; leave unset so the Zed default applies.
+            notify_on_bell: None,
             minimum_contrast: None,
             option_as_meta: self.read_bool("terminal.integrated.macOptionIsMeta"),
             project: self.project_terminal_settings_content(),

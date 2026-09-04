@@ -2181,6 +2181,9 @@
     "show_count_badge": false,
     // Whether to invoke the OS-specific alert sound when the terminal bell (BEL character) is printed.
     "bell": "off",
+    // Whether to post a system notification when a terminal rings the bell while its
+    // window is in the background. Independent of "bell", which only controls the sound.
+    "notify_on_bell": false,
   },
   "code_actions_on_format": {},
   // Settings related to running tasks.

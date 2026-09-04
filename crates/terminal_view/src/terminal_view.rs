@@ -1143,7 +1143,8 @@ fn subscribe_for_terminal_events(
 
                 Event::Bell => {
                     terminal_view.has_bell = true;
-                    if let TerminalBell::System = TerminalSettings::get_global(cx).bell {
+                    let terminal_settings = TerminalSettings::get_global(cx);
+                    if let TerminalBell::System = terminal_settings.bell {
                         window.play_system_bell();
                     }
                     // Nothing carries a bell out of this view: the workspace
@@ -1155,6 +1156,18 @@ fn subscribe_for_terminal_events(
                         .workspace
                         .update(cx, |_, cx| cx.notify())
                         .ok();
+                    // Only when the window is in the background: a bell in the
+                    // terminal you are already looking at needs no notification.
+                    if terminal_settings.notify_on_bell && !window.is_window_active() {
+                        let title = terminal_view.terminal().read(cx).title(true);
+                        cx.show_system_notification(gpui::SystemNotification {
+                            tag: format!("terminal-bell-{}", terminal_view.terminal().entity_id())
+                                .into(),
+                            title: "Terminal".into(),
+                            body: title.into(),
+                            actions: Vec::new(),
+                        });
+                    }
                     cx.emit(Event::Wakeup);
                 }
 
