@@ -9,6 +9,6 @@
       <path d="M417.6 397.3L606.4 626.7" stroke="#000000" stroke-width="38"></path>
     </g></mask>
   </defs>
-  <rect width="1024" height="1024" fill="url(#ground)"></rect>
+  
   <rect width="1024" height="1024" fill="#F5EFE4" mask="url(#cut)"></rect>
 </svg>
