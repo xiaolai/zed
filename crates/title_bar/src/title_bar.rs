@@ -8,7 +8,6 @@ mod update_version;
 use crate::application_menu::{ApplicationMenu, show_menus};
 use crate::plan_chip::PlanChip;
 use agent_settings::{AgentSettings, WindowLayout};
-use arrayvec::ArrayVec;
 use git_ui_core::worktree_picker::WorktreePicker;
 pub use platform_title_bar::{
     self, DraggedWindowTab, MergeAllWindows, MoveTabToNewWindow, PlatformTitleBar,
@@ -41,19 +40,21 @@ use remote::RemoteConnectionOptions;
 use settings::{Settings as _, SettingsStore};
 
 use std::any::TypeId;
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use theme::ActiveTheme;
 use title_bar_settings::TitleBarSettings;
 use ui::{
     Avatar, ButtonLike, ContextMenu, ContextMenuEntry, IconWithIndicator, Indicator, PopoverMenu,
-    PopoverMenuHandle, Tab, TintColor, Tooltip, prelude::*, utils::platform_title_bar_height,
+    PopoverMenuHandle, TintColor, Tooltip, prelude::*, utils::platform_title_bar_height,
 };
 use update_version::UpdateVersion;
 use util::ResultExt;
+use terminal_view::{TerminalView, terminal_panel::TerminalPanel};
 use workspace::{
-    AccessibleMode, MultiWorkspace, ToggleWorktreeSecurity, Workspace,
+    AccessibleMode, MultiWorkspace, ProjectGroupKey, ToggleWorktreeSecurity, Workspace,
     notifications::{NotifyResultExt, NotifyTaskExt as _},
 };
 
@@ -243,7 +244,12 @@ impl Render for TitleBar {
 
         let show_menus = show_menus(cx);
 
-        let mut children = <ArrayVec<_, 5>>::new();
+        // Three segments so the tabs land at the true midpoint: the left and
+        // right segments each take flex_1, so they are always equal width no
+        // matter what they contain, and the middle segment sits between them.
+        let mut children: Vec<AnyElement> = Vec::new();
+        let mut right_children: Vec<AnyElement> = Vec::new();
+        let mut center_child: Option<AnyElement> = None;
 
         let mut project_name = None;
         let mut repository = None;
@@ -328,7 +334,6 @@ impl Render for TitleBar {
                             },
                         )
                         .children(self.render_restricted_mode(cx))
-                        .children(self.render_workspace_tabs(window, cx))
                         .when(render_project_items, |title_bar| {
                             title_bar
                                 .when(title_bar_settings.show_project_items, |title_bar| {
@@ -352,11 +357,30 @@ impl Render for TitleBar {
                 .into_any_element(),
         );
 
-        children.push(self.render_collaborator_list(window, cx).into_any_element());
+        // Absolutely positioned so the tabs sit at the window's midpoint and
+        // grow outward in both directions. A flex child cannot do this here:
+        // the row is justify_between and the collaborator list and banner are
+        // also in the middle, so they would push the tabs off centre.
+        // Centred by two equal-width spacers rather than absolute positioning:
+        // a Position::Absolute child does not take part in layout, and taffy
+        // would not give it a width here. Two flex_1 siblings split the slack
+        // evenly, so the tabs sit midway between the left and right controls
+        // and grow outward in both directions.
+        if let Some(tabs) = self.render_workspace_tabs(cx) {
+            center_child = Some(
+                h_flex()
+                    .flex_none()
+                    .child(tabs)
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                    .into_any_element(),
+            );
+        }
+
+        right_children.push(self.render_collaborator_list(window, cx).into_any_element());
 
         if title_bar_settings.show_onboarding_banner {
             if let Some(banner) = &self.banner {
-                children.push(banner.clone().into_any_element())
+                right_children.push(banner.clone().into_any_element())
             }
         }
 
@@ -376,7 +400,7 @@ impl Render for TitleBar {
                 client::Status::SignedOut | client::Status::AuthenticationError
             );
 
-        children.push(
+        right_children.push(
             h_flex()
                 .pr_1()
                 .gap_1()
@@ -409,6 +433,30 @@ impl Render for TitleBar {
                 })
                 .into_any_element(),
         );
+
+        // Both branches below hand this list to the same justify_between row
+        // (platform_title_bar.rs). When tabs are present the list becomes three
+        // segments -- left and right both flex_1, so they stay equal width and
+        // the tabs land at the midpoint. Without tabs the original flat list is
+        // kept so single-project windows are unchanged.
+        let children: Vec<AnyElement> = match center_child {
+            Some(center) => vec![
+                h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_0p5()
+                    .children(children)
+                    .into_any_element(),
+                center,
+                h_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .justify_end()
+                    .children(right_children)
+                    .into_any_element(),
+            ],
+            None => children.into_iter().chain(right_children).collect(),
+        };
 
         if show_menus {
             self.platform_titlebar.update(cx, |this, _| {
@@ -445,6 +493,49 @@ impl Render for TitleBar {
             });
             self.platform_titlebar.clone().into_any_element()
         }
+    }
+}
+
+/// Whether any terminal in `workspace` has rung the bell and not yet been
+/// looked at. Covers both the centre panes and the terminal dock, since a
+/// terminal can live in either.
+fn workspace_has_terminal_bell(workspace: &Entity<Workspace>, cx: &App) -> bool {
+    let workspace = workspace.read(cx);
+    let in_center = workspace
+        .items_of_type::<TerminalView>(cx)
+        .any(|terminal| terminal.read(cx).has_bell());
+    if in_center {
+        return true;
+    }
+    workspace
+        .panel::<TerminalPanel>(cx)
+        .is_some_and(|panel| {
+            panel.read(cx).panes().iter().any(|pane| {
+                pane.read(cx)
+                    .items_of_type::<TerminalView>()
+                    .any(|terminal| terminal.read(cx).has_bell())
+            })
+        })
+}
+
+/// Switches the window to the workspace for `key`, opening nothing if that
+/// workspace is no longer around. Shared by the inline tabs and the overflow
+/// menu so both paths behave identically.
+fn activate_project_group(
+    multi_workspace: &Entity<MultiWorkspace>,
+    key: &ProjectGroupKey,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let target =
+        multi_workspace
+            .read(cx)
+            .workspace_for_paths(key.path_list(), key.host().as_ref(), cx);
+    if let Some(workspace) = target {
+        multi_workspace.update(cx, |multi_workspace, cx| {
+            multi_workspace.activate(workspace, None, window, cx);
+            multi_workspace.retain_active_workspace(cx);
+        });
     }
 }
 
@@ -753,24 +844,27 @@ impl TitleBar {
     ///
     /// Returns None when the multi-workspace feature is off or only one
     /// workspace is open, so a single-project window looks unchanged.
-    fn render_workspace_tabs(
-        &self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
+    fn render_workspace_tabs(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let multi_workspace = self.multi_workspace.as_ref()?.upgrade()?;
         if !multi_workspace.read(cx).multi_workspace_enabled(cx) {
             return None;
         }
 
-        let groups = multi_workspace.read(cx).project_groups(cx);
+        // Filter before counting: a group with no paths renders nothing, so
+        // counting first could leave a single visible tab.
+        let groups: Vec<_> = multi_workspace
+            .read(cx)
+            .project_groups(cx)
+            .into_iter()
+            .filter(|group| !group.key.path_list().paths().is_empty())
+            .collect();
         if groups.len() < 2 {
             return None;
         }
 
-        // Same disambiguation the sidebar uses, so two directories with the
-        // same basename get distinguishable labels.
-        let mut all_paths: Vec<std::path::PathBuf> = groups
+        // Same disambiguation the sidebar uses, so two directories sharing a
+        // basename stay distinguishable.
+        let mut all_paths: Vec<PathBuf> = groups
             .iter()
             .flat_map(|group| group.key.path_list().paths().iter().cloned())
             .collect();
@@ -780,45 +874,105 @@ impl TitleBar {
             util::disambiguate::compute_disambiguation_details(&all_paths, |path, detail| {
                 project::path_suffix(path, detail)
             });
-        let path_detail_map: std::collections::HashMap<std::path::PathBuf, usize> =
+        let path_detail_map: HashMap<PathBuf, usize> =
             all_paths.into_iter().zip(path_details).collect();
 
-        let active_key = self
-            .workspace
-            .upgrade()
-            .map(|workspace| multi_workspace.read(cx).project_group_key_for_workspace(&workspace, cx));
+        let active_key = self.workspace.upgrade().map(|workspace| {
+            multi_workspace
+                .read(cx)
+                .project_group_key_for_workspace(&workspace, cx)
+        });
 
-        let tabs = groups
-            .into_iter()
-            .filter(|group| !group.key.path_list().paths().is_empty())
-            .enumerate()
-            .map(|(ix, group)| {
-                let key = group.key.clone();
-                let label = key.display_name(&path_detail_map);
-                let is_active = active_key.as_ref() == Some(&key);
-                let multi_workspace = multi_workspace.clone();
+        let multi_workspace_read = multi_workspace.read(cx);
+        let bell_keys: Vec<_> = groups
+            .iter()
+            .filter(|group| {
+                multi_workspace_read
+                    .workspaces_for_project_group(&group.key, cx)
+                    .iter()
+                    .any(|workspace| workspace_has_terminal_bell(workspace, cx))
+            })
+            .map(|group| group.key.clone())
+            .collect();
 
-                Tab::new(("workspace-tab", ix))
-                    .toggle_state(is_active)
-                    .child(Label::new(label).size(LabelSize::Small))
-                    .on_click(move |_, window, cx| {
-                        let target = multi_workspace.read(cx).workspace_for_paths(
-                            key.path_list(),
-                            key.host().as_ref(),
-                            cx,
-                        );
-                        if let Some(workspace) = target {
-                            multi_workspace.update(cx, |multi_workspace, cx| {
-                                multi_workspace.activate(workspace, None, window, cx);
-                                multi_workspace.retain_active_workspace(cx);
+        // A count rather than a measured fit: layout happens after render, so
+        // the available width is unknown here. At least 1, so a configured 0
+        // does not collapse every tab into the menu.
+        let max_inline_tabs = TitleBarSettings::get_global(cx).max_workspace_tabs.max(1);
+        let (inline_groups, overflow) = if groups.len() > max_inline_tabs {
+            let mut inline = groups;
+            let rest = inline.split_off(max_inline_tabs);
+            (inline, rest)
+        } else {
+            (groups, Vec::new())
+        };
+
+        let tabs = inline_groups.into_iter().enumerate().map(|(ix, group)| {
+            let key = group.key;
+            let label =
+                util::truncate_and_trailoff(&key.display_name(&path_detail_map), MAX_PROJECT_NAME_LENGTH);
+            let is_active = active_key.as_ref() == Some(&key);
+            let multi_workspace = multi_workspace.clone();
+
+            let has_bell = bell_keys.contains(&key);
+
+            // ButtonLike rather than Button: Button takes no child slots, and
+            // the bell dot has to sit next to the label. Tab was heavier still
+            // -- it is built for the editor tab bar.
+            ButtonLike::new(("workspace-tab", ix))
+                .toggle_state(is_active)
+                .selected_style(ButtonStyle::Tinted(TintColor::Accent))
+                .child(
+                    Label::new(label)
+                        .size(LabelSize::Small)
+                        .color(if is_active { Color::Default } else { Color::Muted }),
+                )
+                .when(has_bell, |button| {
+                    button.child(Indicator::dot().color(Color::Info))
+                })
+                .on_click(move |_, window, cx| {
+                    activate_project_group(&multi_workspace, &key, window, cx)
+                })
+        });
+
+        let overflow_menu = (!overflow.is_empty()).then(|| {
+            let multi_workspace = multi_workspace.clone();
+            let entries: Vec<_> = overflow
+                .into_iter()
+                .map(|group| {
+                    let label = group.key.display_name(&path_detail_map);
+                    (label, group.key)
+                })
+                .collect();
+
+            PopoverMenu::new("workspace-tabs-overflow")
+                .menu(move |window, cx| {
+                    let multi_workspace = multi_workspace.clone();
+                    let entries = entries.clone();
+                    Some(ContextMenu::build(window, cx, move |mut menu, _, _cx| {
+                        for (label, key) in entries {
+                            let multi_workspace = multi_workspace.clone();
+                            menu = menu.entry(label, None, move |window, cx| {
+                                activate_project_group(&multi_workspace, &key, window, cx)
                             });
                         }
-                    })
-            })
-            .collect::<Vec<_>>();
+                        menu
+                    }))
+                })
+                .trigger(
+                    Button::new("workspace-tabs-overflow-trigger", "…")
+                        .label_size(LabelSize::Small)
+                        .color(Color::Muted),
+                )
+        });
 
-        let _ = window;
-        Some(h_flex().gap_0p5().children(tabs).into_any_element())
+        Some(
+            h_flex()
+                .gap_0p5()
+                .children(tabs)
+                .children(overflow_menu)
+                .into_any_element(),
+        )
     }
 
     pub fn render_project_host(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
