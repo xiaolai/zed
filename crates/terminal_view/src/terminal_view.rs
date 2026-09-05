@@ -516,6 +516,10 @@ impl TerminalView {
 
     pub fn clear_bell(&mut self, cx: &mut Context<TerminalView>) {
         self.has_bell = false;
+        // Mirror of the notify in the bell handler. Without it the indicator
+        // in the title bar appears but never clears: the workspace is not
+        // subscribed to item contents, so nothing else tells it to redraw.
+        self.workspace.update(cx, |_, cx| cx.notify()).ok();
         cx.emit(Event::Wakeup);
     }
 
