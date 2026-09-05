@@ -553,6 +553,10 @@ pub struct StatusBarSettingsContent {
     ///
     /// Default: true
     pub cursor_position_button: Option<bool>,
+    /// Whether to show the button that toggles the threads sidebar.
+    ///
+    /// Default: true
+    pub sidebar_toggle_button: Option<bool>,
     /// Whether to show active line endings button in the status bar.
     ///
     /// Default: false

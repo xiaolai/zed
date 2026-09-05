@@ -814,6 +814,7 @@ impl VsCodeSettings {
             show_active_file: None,
             active_language_button: None,
             cursor_position_button: None,
+            sidebar_toggle_button: None,
             line_endings_button: None,
             active_encoding_button: None,
         })
