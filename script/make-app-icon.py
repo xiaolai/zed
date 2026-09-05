@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
-"""Compose the macOS app icon PNGs from an SVG.
+"""Compose the macOS app icon PNGs from the glyph plus a solid backplate.
 
 The squircle is generated mathematically rather than exported through
 ictool: the macOS 26 renditions all apply the Liquid Glass material, and
 its edge highlight shows up as a light seam. n = 5.0 was fitted against
 Apple's corner profile, so the silhouette matches without inheriting any
 pixels from another icon.
+
+The background is a solid plate rather than the source SVG's gradient,
+and the mask is downsampled with BOX rather than LANCZOS: both remove a
+variable from the edge, where LANCZOS leaves a 252/253 ripple instead of
+a clean 255.
 """
 import subprocess
 import sys
@@ -14,6 +19,7 @@ from pathlib import Path
 from PIL import Image
 
 CANVAS, CONTENT, MARGIN, N, SUPERSAMPLE = 1024, 824, 100, 5.0, 4
+BACKPLATE = (7, 12, 26)  # #070C1A, the deep end of the original gradient
 RESOURCES = Path("crates/zed/resources")
 
 
@@ -29,7 +35,7 @@ def superellipse(size: int, n: float, ss: int) -> Image.Image:
         nx = (1 - ny**n) ** (1 / n)
         for x in range(max(0, int(half - nx * half)), min(big, int(half + nx * half))):
             px[x, y] = 255
-    return mask.resize((size, size), Image.LANCZOS)
+    return mask.resize((size, size), Image.BOX)
 
 
 def main(svg: Path) -> None:
@@ -38,7 +44,9 @@ def main(svg: Path) -> None:
         ["rsvg-convert", "-w", str(CONTENT), "-h", str(CONTENT), str(svg), "-o", str(art_png)],
         check=True,
     )
-    art = Image.open(art_png).convert("RGBA")
+    glyph = Image.open(art_png).convert("RGBA")
+    art = Image.new("RGBA", (CONTENT, CONTENT), BACKPLATE + (255,))
+    art.alpha_composite(glyph)
     art.putalpha(superellipse(CONTENT, N, SUPERSAMPLE))
 
     full = Image.new("RGBA", (CANVAS, CANVAS), (0, 0, 0, 0))
