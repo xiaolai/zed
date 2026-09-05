@@ -1168,14 +1168,28 @@ fn subscribe_for_terminal_events(
                     // Only when the window is in the background: a bell in the
                     // terminal you are already looking at needs no notification.
                     if notify_on_bell && !window.is_window_active() {
-                        let title = terminal_view.terminal().read(cx).title(true);
-                        cx.show_system_notification(gpui::SystemNotification {
-                            tag: format!("terminal-bell-{}", terminal_view.terminal().entity_id())
-                                .into(),
-                            title: "Terminal".into(),
-                            body: title.into(),
-                            actions: Vec::new(),
-                        });
+                        let terminal_title = terminal_view.terminal().read(cx).title(true);
+                        // Tagged per workspace, not per terminal, to match the
+                        // granularity of the title bar indicator: what needs
+                        // answering is a workspace, not one of its terminals.
+                        // Several terminals ringing there replace one another
+                        // instead of stacking up.
+                        let workspace_name = terminal_view
+                            .workspace
+                            .read_with(cx, |workspace, cx| {
+                                workspace
+                                    .project_group_key(cx)
+                                    .display_name(&Default::default())
+                            })
+                            .ok();
+                        if let Some(workspace_name) = workspace_name {
+                            cx.show_system_notification(gpui::SystemNotification {
+                                tag: format!("terminal-bell-{workspace_name}").into(),
+                                title: workspace_name,
+                                body: terminal_title.into(),
+                                actions: Vec::new(),
+                            });
+                        }
                     }
                     cx.emit(Event::Wakeup);
                 }
