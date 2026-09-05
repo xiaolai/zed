@@ -17,6 +17,12 @@ APPLE_NOTARIZATION_TEAM="Y53RSUA3SM"
 # Local keychain profile created with `notarytool store-credentials`.
 NOTARY_PROFILE="${NOTARY_PROFILE:-zed-fork}"
 
+# Fork: zed.dev serves no updates for this build, and every channel except dev
+# polls it. Setting this at compile time stops the updater from starting at all
+# and turns "Check for updates" into this message. A settings-level
+# `auto_update: false` is not enough: it is runtime-only and can be turned back on.
+export ZED_UPDATE_EXPLANATION="${ZED_UPDATE_EXPLANATION:-This is a personal fork of Zed. Update it with: brew upgrade --cask zed}"
+
 # Function for displaying help info
 help_info() {
   echo "
@@ -55,7 +61,10 @@ shift $((OPTIND-1))
 
 # Get release channel
 pushd crates/zed
-channel=$(<RELEASE_CHANNEL)
+# Fork: release builds ship on the stable channel so the bundle name, bundle id
+# and CLI match the official ones. The checked-in RELEASE_CHANNEL stays "dev" so
+# that `cargo run` keeps a data directory separate from the installed app.
+channel="${ZED_RELEASE_CHANNEL:-$(<RELEASE_CHANNEL)}"
 export ZED_RELEASE_CHANNEL="${channel}"
 popd
 
