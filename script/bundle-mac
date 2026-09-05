@@ -9,9 +9,11 @@ open_result=false
 local_install=false
 can_code_sign=false
 
-# This must match the team in the provisioning profile.
-IDENTITY="Zed Industries, Inc."
-APPLE_NOTARIZATION_TEAM="MQ55VZLNZQ"
+# Fork: signed with a personal Developer ID rather than Zed Industries'.
+IDENTITY="Developer ID Application: HANDO K.K. (Y53RSUA3SM)"
+APPLE_NOTARIZATION_TEAM="Y53RSUA3SM"
+# Local keychain profile created with `notarytool store-credentials`.
+NOTARY_PROFILE="${NOTARY_PROFILE:-zed-fork}"
 
 # Function for displaying help info
 help_info() {
@@ -117,7 +119,14 @@ else
     echo "cargo::warning=Missing ${document_icon_source}; macOS document icons may not appear in Finder."
 fi
 
-if [[ -n "${MACOS_CERTIFICATE:-}" && -n "${MACOS_CERTIFICATE_PASSWORD:-}" && -n "${APPLE_NOTARIZATION_KEY:-}" && -n "${APPLE_NOTARIZATION_KEY_ID:-}" && -n "${APPLE_NOTARIZATION_ISSUER_ID:-}" ]]; then
+# Fork: sign from the login keychain. Upstream requires five CI variables and
+# imports a .p12; here the identity is already installed, so presence of the
+# certificate plus a notarytool profile is the condition.
+if security find-identity -v -p codesigning | grep -qF "$IDENTITY" \
+    && xcrun notarytool history --keychain-profile "$NOTARY_PROFILE" >/dev/null 2>&1; then
+    can_code_sign=true
+    echo "Signing as: $IDENTITY (notary profile: $NOTARY_PROFILE)"
+elif [[ -n "${MACOS_CERTIFICATE:-}" && -n "${MACOS_CERTIFICATE_PASSWORD:-}" && -n "${APPLE_NOTARIZATION_KEY:-}" && -n "${APPLE_NOTARIZATION_KEY_ID:-}" && -n "${APPLE_NOTARIZATION_ISSUER_ID:-}" ]]; then
     can_code_sign=true
 
     echo "Setting up keychain for code signing..."
@@ -195,8 +204,9 @@ function sign_app_binaries() {
     echo "Downloading git binary"
     download_git "${target_triple}" "${app_path}/Contents/MacOS/git"
 
-    # Note: The app identifier for our development builds is the same as the app identifier for nightly.
-    cp crates/zed/contents/$channel/embedded.provisionprofile "${app_path}/Contents/"
+    # Fork: upstream's provisioning profile is bound to team MQ55VZLNZQ, which
+    # contradicts this signature. It only backs universal links, so it is omitted.
+    # cp crates/zed/contents/$channel/embedded.provisionprofile "${app_path}/Contents/"
 
     if [[ $can_code_sign = true ]]; then
         echo "Code signing binaries"
@@ -205,6 +215,16 @@ function sign_app_binaries() {
         /usr/bin/codesign --deep --force --timestamp --options runtime --sign "$IDENTITY" "${app_path}/Contents/MacOS/git" -v
         /usr/bin/codesign --deep --force --timestamp --options runtime --entitlements crates/zed/resources/zed.entitlements --sign "$IDENTITY" "${app_path}/Contents/MacOS/zed" -v
         /usr/bin/codesign --force --timestamp --options runtime --entitlements crates/zed/resources/zed.entitlements --sign "$IDENTITY" "${app_path}" -v
+
+        # Fork: notarize and staple the .app as well. Upstream notarizes only the
+        # dmg; a cask extracts the .app from it, and without its own ticket the
+        # first launch needs network access to succeed.
+        echo "Notarizing app bundle"
+        app_zip_path="${app_path}.zip"
+        /usr/bin/ditto -c -k --keepParent "${app_path}" "${app_zip_path}"
+        xcrun notarytool submit --wait --keychain-profile "$NOTARY_PROFILE" "${app_zip_path}"
+        rm -f "${app_zip_path}"
+        xcrun stapler staple "${app_path}"
     else
         echo "One or more of the following variables are missing: MACOS_CERTIFICATE, MACOS_CERTIFICATE_PASSWORD, APPLE_NOTARIZATION_KEY, APPLE_NOTARIZATION_KEY_ID, APPLE_NOTARIZATION_ISSUER_ID"
 
@@ -271,9 +291,7 @@ function sign_app_binaries() {
         if [[ $can_code_sign = true ]]; then
             echo "Notarizing DMG with Apple"
             /usr/bin/codesign --deep --force --timestamp --options runtime --sign "$IDENTITY" "$(pwd)/${dmg_file_path}" -v
-            echo "$APPLE_NOTARIZATION_KEY" > "$notarization_key_file"
-            "${xcode_bin_dir_path}/notarytool" submit --wait --key "$notarization_key_file" --key-id "$APPLE_NOTARIZATION_KEY_ID" --issuer "$APPLE_NOTARIZATION_ISSUER_ID" "${dmg_file_path}"
-            rm "$notarization_key_file"
+            xcrun notarytool submit --wait --keychain-profile "$NOTARY_PROFILE" "${dmg_file_path}"
             "${xcode_bin_dir_path}/stapler" staple "${dmg_file_path}"
         fi
 
