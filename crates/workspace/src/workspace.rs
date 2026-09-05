@@ -852,7 +852,52 @@ pub fn prompt_for_open_path_and_open(
     .detach();
 }
 
+/// Prefix for terminal bell notifications. The remainder of the tag is the
+/// [`EntityId`] of the workspace that rang, so clicking the notification can
+/// bring that workspace forward.
+pub const BELL_NOTIFICATION_TAG_PREFIX: &str = "terminal-bell-";
+
+/// Brings the workspace named by a bell notification's tag to the front, so
+/// clicking the notification lands in the same place as clicking its tab in
+/// the title bar.
+fn activate_workspace_from_notification_tag(tag: &str, cx: &mut App) {
+    let Some(workspace_id) = tag
+        .strip_prefix(BELL_NOTIFICATION_TAG_PREFIX)
+        .and_then(|id| id.parse::<u64>().ok())
+    else {
+        return;
+    };
+
+    for handle in cx.windows() {
+        let Some(multi_workspace) = handle.downcast::<MultiWorkspace>() else {
+            continue;
+        };
+        let activated = multi_workspace
+            .update(cx, |multi_workspace, window, cx| {
+                let target = multi_workspace
+                    .project_groups(cx)
+                    .into_iter()
+                    .flat_map(|group| group.workspaces)
+                    .find(|workspace| workspace.entity_id().as_u64() == workspace_id);
+                let Some(target) = target else {
+                    return false;
+                };
+                multi_workspace.activate(target, None, window, cx);
+                multi_workspace.retain_active_workspace(cx);
+                window.activate_window();
+                true
+            })
+            .unwrap_or(false);
+        if activated {
+            return;
+        }
+    }
+}
+
 pub fn init(app_state: Arc<AppState>, cx: &mut App) {
+    cx.on_system_notification_response(|response, cx| {
+        activate_workspace_from_notification_tag(&response.tag, cx);
+    });
     component::init();
     theme_preview::init(cx);
     toast_layer::init(cx);

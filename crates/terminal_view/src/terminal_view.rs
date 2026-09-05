@@ -48,6 +48,7 @@ use ui::{
     scrollbars::{self, ScrollbarVisibility},
 };
 use util::ResultExt;
+use workspace::BELL_NOTIFICATION_TAG_PREFIX;
 use workspace::{
     CloseActiveItem, DraggedSelection, DraggedTab, NewCenterTerminal, NewTerminal, Pane,
     ToolbarItemLocation, Workspace, WorkspaceId, delete_unloaded_items,
@@ -1182,9 +1183,15 @@ fn subscribe_for_terminal_events(
                                     .display_name(&Default::default())
                             })
                             .ok();
+                        // The tag carries the workspace's entity id so the
+                        // handler in workspace::init can activate exactly this
+                        // workspace when the notification is clicked. It also
+                        // keeps the per-workspace grouping: further bells in
+                        // the same workspace replace the notification.
+                        let workspace_id = terminal_view.workspace.entity_id().as_u64();
                         if let Some(workspace_name) = workspace_name {
                             cx.show_system_notification(gpui::SystemNotification {
-                                tag: format!("terminal-bell-{workspace_name}").into(),
+                                tag: format!("{BELL_NOTIFICATION_TAG_PREFIX}{workspace_id}").into(),
                                 title: workspace_name,
                                 body: terminal_title.into(),
                                 actions: Vec::new(),
