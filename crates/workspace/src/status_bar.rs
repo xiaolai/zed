@@ -1,3 +1,4 @@
+use crate::StatusBarSettings;
 use crate::{
     ItemHandle, MultiWorkspace, Pane, SidebarSide, ToggleWorkspaceSidebar,
     sidebar_side_context_menu,
@@ -6,7 +7,7 @@ use gpui::{
     Anchor, AnyView, App, Context, Decorations, Entity, FocusHandle, Focusable, IntoElement,
     ParentElement, Render, Role, SharedString, Styled, Subscription, WeakEntity, Window,
 };
-use settings::{SettingsContent, update_settings_file};
+use settings::{Settings as _, SettingsContent, update_settings_file};
 use std::{any::TypeId, sync::Arc};
 use theme::CLIENT_SIDE_DECORATION_ROUNDING;
 use ui::{ContextMenu, Divider, IconPosition, Indicator, Tooltip, prelude::*, right_click_menu};
@@ -90,7 +91,8 @@ impl SidebarStatus {
                     open: mw.sidebar_open() && enabled,
                     side: mw.sidebar_side(cx),
                     has_notifications: mw.sidebar_has_notifications(cx),
-                    show_toggle: enabled,
+                    show_toggle: enabled
+                        && StatusBarSettings::get_global(cx).sidebar_toggle_button,
                 }
             })
             .unwrap_or_default()
