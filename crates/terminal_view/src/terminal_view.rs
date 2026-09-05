@@ -1249,6 +1249,15 @@ fn subscribe_for_terminal_events(
                     if let TerminalBell::System = TerminalSettings::get_global(cx).bell {
                         window.play_system_bell();
                     }
+                    // Nothing carries a bell out of this view: the workspace
+                    // subscribes to pane events, not to item contents. Notify it
+                    // directly so views that summarise terminal state -- the
+                    // title bar's workspace tabs -- can redraw. Failure just
+                    // means the workspace is gone, which is not an error here.
+                    terminal_view
+                        .workspace
+                        .update(cx, |_, cx| cx.notify())
+                        .ok();
                     cx.emit(Event::Wakeup);
                 }
 

@@ -617,6 +617,8 @@
   "title_bar": {
     // Whether to show git status indicators on the branch icon in the titlebar.
     "show_branch_status_icon": false,
+    // How many workspace tabs to show before the rest collapse into an overflow menu.
+    "max_workspace_tabs": 5,
     // Whether to show the branch name button in the titlebar.
     "show_branch_name": true,
     // Whether to show the worktree name button in the titlebar.

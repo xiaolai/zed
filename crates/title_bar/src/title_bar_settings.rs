@@ -13,6 +13,7 @@ pub struct TitleBarSettings {
     pub show_user_menu: bool,
     pub show_menus: bool,
     pub open_menus_on_hover: bool,
+    pub max_workspace_tabs: usize,
     pub button_layout: Option<WindowButtonLayout>,
 }
 
@@ -30,6 +31,7 @@ impl Settings for TitleBarSettings {
             show_user_menu: content.show_user_menu.unwrap(),
             show_menus: content.show_menus.unwrap(),
             open_menus_on_hover: content.open_menus_on_hover.unwrap(),
+            max_workspace_tabs: content.max_workspace_tabs.unwrap(),
             button_layout: content.button_layout.unwrap_or_default().into_layout(),
         }
     }

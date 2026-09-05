@@ -123,6 +123,12 @@ pub struct TitleBarSettingsContent {
     ///
     /// Default: false
     pub open_menus_on_hover: Option<bool>,
+    /// How many workspace tabs to show in the title bar before the rest are
+    /// collapsed into an overflow menu. Only applies when more than one
+    /// workspace is open in the window.
+    ///
+    /// Default: 5
+    pub max_workspace_tabs: Option<usize>,
     /// The layout of window control buttons in the title bar (Linux only).
     ///
     /// This can be set to "platform_default" to follow the system configuration, or
