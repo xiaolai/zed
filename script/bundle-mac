@@ -146,8 +146,28 @@ fi
 # Fork: sign from the login keychain. Upstream requires five CI variables and
 # imports a .p12; here the identity is already installed, so presence of the
 # certificate plus a notarytool profile is the condition.
+notary_profile_ok=false
+if xcrun notarytool history --keychain-profile "$NOTARY_PROFILE" >/dev/null 2>&1; then
+    notary_profile_ok=true
+fi
+
+# A signing pass exists only to notarize, so an unreadable profile has to stop
+# it rather than fall through: the branch below signs ad-hoc when it finds no
+# CI variables, and that dmg looks built while Gatekeeper refuses to open it.
+# The build machine holds the same certificate and no profile, and is meant to
+# produce an unsigned bundle for this machine to sign, so it still falls
+# through -- which is why the test is the prebuilt app and not the identity.
+if [[ -n "${ZED_PREBUILT_APP:-}" && $notary_profile_ok = false ]]; then
+    echo "notarytool cannot read the '${NOTARY_PROFILE}' keychain profile." >&2
+    echo "Recreate it with:" >&2
+    echo "  xcrun notarytool store-credentials ${NOTARY_PROFILE} \\" >&2
+    echo "    --apple-id <apple-id> --team-id ${APPLE_NOTARIZATION_TEAM} \\" >&2
+    echo "    --password <app-specific-password>" >&2
+    exit 1
+fi
+
 if security find-identity -v -p codesigning | grep -qF "$IDENTITY" \
-    && xcrun notarytool history --keychain-profile "$NOTARY_PROFILE" >/dev/null 2>&1; then
+    && [[ $notary_profile_ok = true ]]; then
     can_code_sign=true
     echo "Signing as: $IDENTITY (notary profile: $NOTARY_PROFILE)"
 elif [[ -n "${MACOS_CERTIFICATE:-}" && -n "${MACOS_CERTIFICATE_PASSWORD:-}" && -n "${APPLE_NOTARIZATION_KEY:-}" && -n "${APPLE_NOTARIZATION_KEY_ID:-}" && -n "${APPLE_NOTARIZATION_ISSUER_ID:-}" ]]; then
