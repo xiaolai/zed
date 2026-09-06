@@ -272,6 +272,73 @@ async fn test_move_active_project_group_actions(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+async fn test_reorder_project_group(cx: &mut TestAppContext) {
+    init_test(cx);
+    let fs = FakeFs::new(cx.executor());
+    fs.insert_tree("/root_a", json!({ "file.txt": "" })).await;
+    fs.insert_tree("/root_b", json!({ "file.txt": "" })).await;
+    fs.insert_tree("/root_c", json!({ "file.txt": "" })).await;
+    let project_a = Project::test(fs.clone(), ["/root_a".as_ref()], cx).await;
+    let project_b = Project::test(fs.clone(), ["/root_b".as_ref()], cx).await;
+    let project_c = Project::test(fs, ["/root_c".as_ref()], cx).await;
+
+    let key_a = project_a.read_with(cx, |project, cx| project.project_group_key(cx));
+    let key_b = project_b.read_with(cx, |project, cx| project.project_group_key(cx));
+    let key_c = project_c.read_with(cx, |project, cx| project.project_group_key(cx));
+
+    let (multi_workspace, cx) =
+        cx.add_window_view(|window, cx| MultiWorkspace::test_new(project_a, window, cx));
+    multi_workspace.update_in(cx, |multi_workspace, window, cx| {
+        multi_workspace.test_add_workspace(project_b, window, cx);
+        multi_workspace.test_add_workspace(project_c, window, cx);
+    });
+
+    assert_eq!(
+        multi_workspace.read_with(cx, |multi_workspace, _| {
+            multi_workspace.project_group_keys()
+        }),
+        vec![key_c.clone(), key_b.clone(), key_a.clone()]
+    );
+
+    // Dropping a tab onto one that sorts after it takes that slot.
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        assert!(multi_workspace.reorder_project_group(&key_c, &key_a, cx));
+    });
+    assert_eq!(
+        multi_workspace.read_with(cx, |multi_workspace, _| {
+            multi_workspace.project_group_keys()
+        }),
+        vec![key_b.clone(), key_a.clone(), key_c.clone()]
+    );
+
+    // And dropping it back onto one that sorts before it.
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        assert!(multi_workspace.reorder_project_group(&key_c, &key_b, cx));
+    });
+    assert_eq!(
+        multi_workspace.read_with(cx, |multi_workspace, _| {
+            multi_workspace.project_group_keys()
+        }),
+        vec![key_c.clone(), key_b.clone(), key_a.clone()]
+    );
+
+    // A tab dropped on itself changes nothing, and neither does a key that is
+    // no longer open -- either end of the drag can close while it is in flight.
+    let closed_key = ProjectGroupKey::new(None, PathList::new(&[PathBuf::from("/root_d")]));
+    multi_workspace.update(cx, |multi_workspace, cx| {
+        assert!(!multi_workspace.reorder_project_group(&key_c, &key_c, cx));
+        assert!(!multi_workspace.reorder_project_group(&closed_key, &key_a, cx));
+        assert!(!multi_workspace.reorder_project_group(&key_a, &closed_key, cx));
+    });
+    assert_eq!(
+        multi_workspace.read_with(cx, |multi_workspace, _| {
+            multi_workspace.project_group_keys()
+        }),
+        vec![key_c, key_b, key_a]
+    );
+}
+
+#[gpui::test]
 async fn test_open_new_window_does_not_open_sidebar_on_existing_window(cx: &mut TestAppContext) {
     init_test(cx);
 
