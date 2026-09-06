@@ -929,6 +929,39 @@ impl MultiWorkspace {
         true
     }
 
+    /// Moves the group identified by `key` into the slot currently held by
+    /// `target`, shifting the groups in between. Unlike the swap-based
+    /// [`Self::move_project_group_up`] and [`Self::move_project_group_down`],
+    /// this expresses an arbitrary drop position, which is what dragging a
+    /// workspace tab needs.
+    pub fn reorder_project_group(
+        &mut self,
+        key: &ProjectGroupKey,
+        target: &ProjectGroupKey,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if key == target {
+            return false;
+        }
+        let Some(from) = self.project_groups.iter().position(|group| group.key == *key) else {
+            return false;
+        };
+        let Some(to) = self
+            .project_groups
+            .iter()
+            .position(|group| group.key == *target)
+        else {
+            return false;
+        };
+
+        let group = self.project_groups.remove(from);
+        self.project_groups.insert(to, group);
+        cx.emit(MultiWorkspaceEvent::ProjectGroupsChanged);
+        self.serialize(cx);
+        cx.notify();
+        true
+    }
+
     pub fn workspaces_for_project_group(
         &self,
         key: &ProjectGroupKey,
