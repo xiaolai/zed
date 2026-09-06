@@ -123,7 +123,7 @@ pub struct TitleBarSettingsContent {
     /// collapsed into an overflow menu. Only applies when more than one
     /// workspace is open in the window.
     ///
-    /// Default: 5
+    /// Default: 8
     pub max_workspace_tabs: Option<usize>,
     /// The layout of window control buttons in the title bar (Linux only).
     ///
