@@ -221,6 +221,18 @@ ${verdict}"
 
 stage_publish() {
     [ -f "$DMG_PATH" ] || die "no dmg at ${DMG_PATH}; run the sign stage first"
+
+    # A dmg on disk is not evidence that the sign stage approved it. A sign run
+    # that fails after building the dmg leaves it there, and one that lost the
+    # notary profile leaves an ad-hoc signed one -- indistinguishable by name,
+    # size or timestamp from a good release. Re-ask Gatekeeper here rather than
+    # trusting that the previous stage got far enough.
+    xcrun stapler validate "$DMG_PATH" >/dev/null 2>&1 \
+        || die "${DMG_PATH} carries no notarization ticket; re-run the sign stage"
+    grep -q "source=Notarized Developer ID" \
+        <<<"$(spctl -a -vvv -t open --context context:primary-signature "$DMG_PATH" 2>&1)" \
+        || die "Gatekeeper does not accept ${DMG_PATH} as notarized; re-run the sign stage"
+
     local version tag sha
     version=$(fork_version)
     tag="v${version}"
