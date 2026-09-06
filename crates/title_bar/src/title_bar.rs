@@ -26,8 +26,8 @@ use client::{Client, UserStore, zed_urls};
 use command_palette_hooks::CommandPaletteFilter;
 
 use gpui::{
-    Action, Anchor, Animation, AnimationExt, AnyElement, App, Context, Element, Entity, Focusable,
-    InteractiveElement, IntoElement, MouseButton, ParentElement, Render,
+    Action, Anchor, Animation, AnimationExt, AnyElement, App, ClickEvent, Context, Element, Entity,
+    Focusable, InteractiveElement, IntoElement, MouseButton, ParentElement, Render,
     StatefulInteractiveElement, Styled, Subscription, TaskExt, WeakEntity, Window, actions, div,
     pulsating_between,
 };
@@ -41,6 +41,7 @@ use settings::{Settings as _, SettingsStore};
 
 use std::any::TypeId;
 use std::collections::HashMap;
+use std::hash::{Hash as _, Hasher as _};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -368,8 +369,13 @@ impl Render for TitleBar {
         // and grow outward in both directions.
         if let Some(tabs) = self.render_workspace_tabs(cx) {
             center_child = Some(
+                // Shrinkable rather than flex_none: the count in
+                // `max_workspace_tabs` cannot know the window width, so on a
+                // narrow window the tabs give way and their labels truncate
+                // instead of crowding the controls on either side.
                 h_flex()
-                    .flex_none()
+                    .flex_shrink(1.)
+                    .min_w_0()
                     .child(tabs)
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                     .into_any_element(),
@@ -537,6 +543,102 @@ fn activate_project_group(
             multi_workspace.retain_active_workspace(cx);
         });
     }
+}
+
+/// Hover group shared by a workspace tab and its close button, so the button
+/// only appears while the pointer is on that tab.
+const WORKSPACE_TAB_HOVER_GROUP: &str = "workspace-tab";
+
+/// Element IDs built from a project group's identity rather than its position,
+/// so GPUI's per-element state -- focus, hover, a half-finished click -- follows
+/// a project when the tabs are reordered instead of staying with the slot.
+fn workspace_tab_element_id(name: &'static str, key: &ProjectGroupKey) -> ElementId {
+    let mut hasher = std::hash::DefaultHasher::new();
+    key.hash(&mut hasher);
+    (name, hasher.finish()).into()
+}
+
+/// Rendering inputs for one workspace tab, gathered once so the inline tabs
+/// and the overflow menu can show the same information.
+#[derive(Clone)]
+struct WorkspaceTab {
+    key: ProjectGroupKey,
+    /// Shortened to fit a tab.
+    label: SharedString,
+    /// The full disambiguated name, used by the overflow menu.
+    name: SharedString,
+    /// Every path in the group, for the tooltip.
+    paths: SharedString,
+    is_active: bool,
+    has_bell: bool,
+}
+
+/// A workspace tab being dragged along the title bar to reorder it.
+#[derive(Clone)]
+struct DraggedWorkspaceTab {
+    key: ProjectGroupKey,
+    label: SharedString,
+}
+
+impl Render for DraggedWorkspaceTab {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .px_1p5()
+            .py_0p5()
+            .rounded_sm()
+            .bg(cx.theme().colors().element_selected)
+            .child(Label::new(self.label.clone()).size(LabelSize::Small))
+    }
+}
+
+/// Splits tab positions into the ones shown inline and the ones that collapse
+/// into the overflow menu.
+///
+/// The active tab is always inline: when it sorts past the limit it takes the
+/// last inline slot, because a row of tabs with none of them marked active
+/// says nothing about which workspace you are in.
+fn partition_workspace_tabs(
+    count: usize,
+    max_inline: usize,
+    active_index: Option<usize>,
+) -> (Vec<usize>, Vec<usize>) {
+    if count <= max_inline {
+        return ((0..count).collect(), Vec::new());
+    }
+
+    let mut inline: Vec<usize> = (0..max_inline).collect();
+    if let Some(active_index) = active_index.filter(|index| *index >= max_inline) {
+        inline.pop();
+        inline.push(active_index);
+    }
+
+    let overflow = (0..count)
+        .filter(|index| !inline.contains(index))
+        .collect();
+    (inline, overflow)
+}
+
+/// Closes every workspace in a project group.
+///
+/// Unsaved buffers still raise the usual save prompt, and cancelling it aborts
+/// the whole removal, so that prompt is the confirmation. A second "are you
+/// sure?" would disagree with the sidebar's Remove entry, which closes a group
+/// without one.
+///
+/// A failure is notified rather than only logged: closing is user-initiated, so
+/// a project that refuses to close has to say so.
+fn close_project_group(
+    multi_workspace: &Entity<MultiWorkspace>,
+    workspace: &WeakEntity<Workspace>,
+    key: &ProjectGroupKey,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    multi_workspace
+        .update(cx, |multi_workspace, cx| {
+            multi_workspace.remove_project_group(key, window, cx)
+        })
+        .detach_and_notify_err(workspace.clone(), window, cx);
 }
 
 impl TitleBar {
@@ -884,95 +986,246 @@ impl TitleBar {
         });
 
         let multi_workspace_read = multi_workspace.read(cx);
-        let bell_keys: Vec<_> = groups
-            .iter()
-            .filter(|group| {
-                multi_workspace_read
+        let tabs: Vec<WorkspaceTab> = groups
+            .into_iter()
+            .map(|group| {
+                let has_bell = multi_workspace_read
                     .workspaces_for_project_group(&group.key, cx)
                     .iter()
-                    .any(|workspace| workspace_has_terminal_bell(workspace, cx))
+                    .any(|workspace| workspace_has_terminal_bell(workspace, cx));
+                let name = group.key.display_name(&path_detail_map);
+                let paths = group
+                    .key
+                    .path_list()
+                    .ordered_paths()
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                WorkspaceTab {
+                    label: util::truncate_and_trailoff(&name, MAX_PROJECT_NAME_LENGTH).into(),
+                    is_active: active_key.as_ref() == Some(&group.key),
+                    paths: paths.into(),
+                    has_bell,
+                    name,
+                    key: group.key,
+                }
             })
-            .map(|group| group.key.clone())
             .collect();
 
         // A count rather than a measured fit: layout happens after render, so
         // the available width is unknown here. At least 1, so a configured 0
         // does not collapse every tab into the menu.
         let max_inline_tabs = TitleBarSettings::get_global(cx).max_workspace_tabs.max(1);
-        let (inline_groups, overflow) = if groups.len() > max_inline_tabs {
-            let mut inline = groups;
-            let rest = inline.split_off(max_inline_tabs);
-            (inline, rest)
-        } else {
-            (groups, Vec::new())
-        };
+        let active_index = tabs.iter().position(|tab| tab.is_active);
+        let (inline, overflow) = partition_workspace_tabs(tabs.len(), max_inline_tabs, active_index);
 
-        let tabs = inline_groups.into_iter().enumerate().map(|(ix, group)| {
-            let key = group.key;
-            let label =
-                util::truncate_and_trailoff(&key.display_name(&path_detail_map), MAX_PROJECT_NAME_LENGTH);
-            let is_active = active_key.as_ref() == Some(&key);
-            let multi_workspace = multi_workspace.clone();
+        let mut inline_tabs = Vec::with_capacity(inline.len());
+        for index in inline {
+            if let Some(tab) = tabs.get(index) {
+                inline_tabs.push(self.render_workspace_tab(tab, &multi_workspace, cx));
+            }
+        }
 
-            let has_bell = bell_keys.contains(&key);
+        let overflow_tabs: Vec<WorkspaceTab> = overflow
+            .into_iter()
+            .filter_map(|index| tabs.get(index).cloned())
+            .collect();
 
-            // ButtonLike rather than Button: Button takes no child slots, and
-            // the bell dot has to sit next to the label. Tab was heavier still
-            // -- it is built for the editor tab bar.
-            ButtonLike::new(("workspace-tab", ix))
-                .toggle_state(is_active)
-                .selected_style(ButtonStyle::Tinted(TintColor::Accent))
-                .child(
-                    Label::new(label)
-                        .size(LabelSize::Small)
-                        .color(if is_active { Color::Default } else { Color::Muted }),
-                )
-                .when(has_bell, |button| {
-                    button.child(Indicator::dot().color(Color::Info))
-                })
-                .on_click(move |_, window, cx| {
-                    activate_project_group(&multi_workspace, &key, window, cx)
-                })
-        });
+        Some(
+            h_flex()
+                // The tabs are one selection: naming the row as a tab list lets
+                // assistive technology report "tab 2 of 5" instead of five
+                // unrelated buttons. The id is what makes `role` reachable --
+                // it lives on StatefulInteractiveElement.
+                .id("workspace-tabs")
+                .role(gpui::Role::TabList)
+                .min_w_0()
+                .gap_0p5()
+                .children(inline_tabs)
+                .children(self.render_workspace_tabs_overflow(overflow_tabs, &multi_workspace))
+                .into_any_element(),
+        )
+    }
 
-        let overflow_menu = (!overflow.is_empty()).then(|| {
-            let multi_workspace = multi_workspace.clone();
-            let entries: Vec<_> = overflow
-                .into_iter()
-                .map(|group| {
-                    let label = group.key.display_name(&path_detail_map);
-                    (label, group.key)
-                })
-                .collect();
+    /// The menu holding the tabs that did not fit.
+    ///
+    /// Entries carry the bell that a collapsed tab would have shown, and the
+    /// trigger carries one too, so a terminal ringing in a hidden project is
+    /// still visible. No entry is ever marked active: `partition_workspace_tabs`
+    /// keeps the active tab inline.
+    fn render_workspace_tabs_overflow(
+        &self,
+        tabs: Vec<WorkspaceTab>,
+        multi_workspace: &Entity<MultiWorkspace>,
+    ) -> Option<impl IntoElement + use<>> {
+        if tabs.is_empty() {
+            return None;
+        }
 
+        let has_bell = tabs.iter().any(|tab| tab.has_bell);
+        let multi_workspace = multi_workspace.clone();
+
+        Some(
             PopoverMenu::new("workspace-tabs-overflow")
                 .menu(move |window, cx| {
                     let multi_workspace = multi_workspace.clone();
-                    let entries = entries.clone();
+                    let tabs = tabs.clone();
                     Some(ContextMenu::build(window, cx, move |mut menu, _, _cx| {
-                        for (label, key) in entries {
+                        for tab in tabs {
                             let multi_workspace = multi_workspace.clone();
-                            menu = menu.entry(label, None, move |window, cx| {
-                                activate_project_group(&multi_workspace, &key, window, cx)
+                            let key = tab.key;
+                            let entry = ContextMenuEntry::new(tab.name).handler(
+                                move |window, cx| {
+                                    activate_project_group(&multi_workspace, &key, window, cx)
+                                },
+                            );
+                            menu = menu.item(if tab.has_bell {
+                                entry
+                                    .icon(IconName::BellRing)
+                                    .icon_position(IconPosition::End)
+                                    .icon_color(Color::Info)
+                            } else {
+                                entry
                             });
                         }
                         menu
                     }))
                 })
                 .trigger(
-                    Button::new("workspace-tabs-overflow-trigger", "…")
-                        .label_size(LabelSize::Small)
-                        .color(Color::Muted),
-                )
-        });
-
-        Some(
-            h_flex()
-                .gap_0p5()
-                .children(tabs)
-                .children(overflow_menu)
-                .into_any_element(),
+                    ButtonLike::new("workspace-tabs-overflow-trigger")
+                        .child(Label::new("…").size(LabelSize::Small).color(Color::Muted))
+                        .when(has_bell, |trigger| {
+                            trigger.child(Indicator::dot().color(Color::Info))
+                        }),
+                ),
         )
+    }
+
+    /// One inline workspace tab.
+    ///
+    /// A stateful `div` rather than a `ButtonLike`: the tab carries a drag
+    /// payload, a hover group for its close button, and its own selected
+    /// background, and `ButtonLike` exposes none of those.
+    fn render_workspace_tab(
+        &self,
+        tab: &WorkspaceTab,
+        multi_workspace: &Entity<MultiWorkspace>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let (
+            selected_background,
+            hover_background,
+            drop_target_background,
+            transparent_border,
+            focused_border,
+        ) = {
+            let colors = cx.theme().colors();
+            (
+                colors.element_selected,
+                colors.ghost_element_hover,
+                colors.drop_target_background,
+                colors.border.opacity(0.),
+                colors.border_focused,
+            )
+        };
+        let key = tab.key.clone();
+        let is_active = tab.is_active;
+        let workspace = self.workspace.clone();
+
+        let close_button =
+            IconButton::new(workspace_tab_element_id("close-workspace-tab", &key), IconName::Close)
+                .icon_size(IconSize::XSmall)
+                .icon_color(Color::Muted)
+                .size(ButtonSize::None)
+                .visible_on_hover(WORKSPACE_TAB_HOVER_GROUP)
+                .tooltip(Tooltip::text("Close Project"))
+                .on_click({
+                    let multi_workspace = multi_workspace.clone();
+                    let workspace = workspace.clone();
+                    let key = key.clone();
+                    move |_, window, cx| {
+                        // Without this the tab underneath also activates the
+                        // group that is on its way out.
+                        cx.stop_propagation();
+                        close_project_group(&multi_workspace, &workspace, &key, window, cx);
+                    }
+                });
+
+        h_flex()
+            .id(workspace_tab_element_id("workspace-tab", &key))
+            .group(WORKSPACE_TAB_HOVER_GROUP)
+            // Without an explicit role a bare div is reported as a generic
+            // container, so the tab that ButtonLike used to announce would
+            // otherwise vanish from the accessibility tree.
+            .role(gpui::Role::Tab)
+            .min_w_0()
+            .px_1p5()
+            .py_0p5()
+            .gap_1()
+            .rounded_sm()
+            .tab_index(0isize)
+            .aria_label(tab.name.clone())
+            .aria_selected(is_active)
+            // The border is always drawn so that taking keyboard focus changes
+            // its colour rather than the tab's size.
+            .border_1()
+            .border_color(transparent_border)
+            .focus_visible(move |style| style.border_color(focused_border))
+            .when(is_active, |this| this.bg(selected_background))
+            .when(!is_active, |this| {
+                this.hover(move |style| style.bg(hover_background))
+            })
+            .child(
+                Label::new(tab.label.clone())
+                    .size(LabelSize::Small)
+                    .color(if is_active {
+                        Color::Default
+                    } else {
+                        Color::Muted
+                    })
+                    .truncate(),
+            )
+            .when(tab.has_bell, |this| {
+                this.child(Indicator::dot().color(Color::Info))
+            })
+            .child(close_button)
+            .tooltip(Tooltip::text(tab.paths.clone()))
+            .on_click({
+                let multi_workspace = multi_workspace.clone();
+                let key = key.clone();
+                move |_, window, cx| activate_project_group(&multi_workspace, &key, window, cx)
+            })
+            .on_aux_click({
+                let multi_workspace = multi_workspace.clone();
+                let key = key.clone();
+                move |event: &ClickEvent, window, cx| {
+                    if !event.is_middle_click() {
+                        return;
+                    }
+                    close_project_group(&multi_workspace, &workspace, &key, window, cx);
+                    cx.stop_propagation();
+                }
+            })
+            .on_drag(
+                DraggedWorkspaceTab {
+                    key: key.clone(),
+                    label: tab.label.clone(),
+                },
+                |dragged, _, _, cx| cx.new(|_| dragged.clone()),
+            )
+            .drag_over::<DraggedWorkspaceTab>(move |style, _, _, _| {
+                style.bg(drop_target_background)
+            })
+            .on_drop({
+                let multi_workspace = multi_workspace.clone();
+                let key = key.clone();
+                move |dragged: &DraggedWorkspaceTab, _window, cx| {
+                    multi_workspace.update(cx, |multi_workspace, cx| {
+                        multi_workspace.reorder_project_group(&dragged.key, &key, cx);
+                    });
+                }
+            })
+            .into_any_element()
     }
 
     pub fn render_project_host(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -1675,6 +1928,38 @@ impl TitleBar {
 mod tests {
     use super::*;
     use util::paths::PathStyle;
+
+    #[test]
+    fn test_workspace_tabs_all_fit_inline() {
+        assert_eq!(
+            partition_workspace_tabs(3, 5, Some(1)),
+            (vec![0, 1, 2], vec![])
+        );
+    }
+
+    #[test]
+    fn test_workspace_tabs_overflow_keeps_leading_tabs() {
+        assert_eq!(
+            partition_workspace_tabs(6, 3, Some(1)),
+            (vec![0, 1, 2], vec![3, 4, 5])
+        );
+    }
+
+    #[test]
+    fn test_active_workspace_tab_takes_the_last_inline_slot() {
+        assert_eq!(
+            partition_workspace_tabs(6, 3, Some(5)),
+            (vec![0, 1, 5], vec![2, 3, 4])
+        );
+    }
+
+    #[test]
+    fn test_workspace_tabs_without_an_active_tab_overflow_from_the_end() {
+        assert_eq!(
+            partition_workspace_tabs(4, 2, None),
+            (vec![0, 1], vec![2, 3])
+        );
+    }
 
     #[test]
     fn test_foreign_path_style_does_not_use_repository_identity_as_name_anchor() {
