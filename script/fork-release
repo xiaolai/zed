@@ -104,11 +104,19 @@ This compiles cleanly and panics at runtime. Restore the hunk before building."
 stage_build() {
     require_build_host
     step "Pushing ${BRANCH} to the builder"
+    # Leased rather than plain: the sync stage rebases, and amending after a
+    # failed check rewrites too, so the push is regularly not a fast-forward.
+    # The lease names the commit the builder is expected to be on, so this
+    # overwrites our own push and nothing else. Pushing to a URL leaves no
+    # remote-tracking ref, which is why the expected value has to be read off
+    # the builder rather than left implicit.
+    local local_head remote_head
+    remote_head=$(ssh "$BUILD_HOST" 'cd ~/github/zed && git rev-parse HEAD')
     # The builder sets receive.denyCurrentBranch=updateInstead, so this updates
     # its working tree as well as the ref.
-    git push --no-verify "${BUILD_HOST#*@}:github/zed" "${BRANCH}"
+    git push --no-verify --force-with-lease="${BRANCH}:${remote_head}" \
+        "${BUILD_HOST#*@}:github/zed" "${BRANCH}"
 
-    local local_head remote_head
     local_head=$(git rev-parse HEAD)
     remote_head=$(ssh "$BUILD_HOST" 'cd ~/github/zed && git rev-parse HEAD')
     [ "$local_head" = "$remote_head" ] \
