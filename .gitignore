@@ -64,3 +64,7 @@ crates/docs_preprocessor/actions.json
 
 # Local artifacts from icon work
 dev-docs/
+
+# Build-host address for script/fork-release. Private overlay network:
+# it must not reach a public fork.
+.fork-release.env

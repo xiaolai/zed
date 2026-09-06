@@ -1,0 +1,265 @@
+#!/usr/bin/env bash
+#
+# Rebase this fork onto upstream, build it on a machine with enough memory for
+# thin LTO, sign it here where the Developer ID lives, and publish it.
+#
+# Split into stages because the two slow ones cost ~16 and ~7 minutes; a failure
+# in `publish` must not force a rebuild. Each stage is independently re-runnable.
+#
+#   script/fork-release sync      rebase onto upstream and check the result
+#   script/fork-release build     compile on the remote builder
+#   script/fork-release sign      bring the bundle back, sign, notarize, staple
+#   script/fork-release publish   push the branch, cut a release, bump the cask
+#   script/fork-release all       every stage in order
+#
+# Configuration comes from the environment, or from .fork-release.env beside
+# this repo's root. That file is gitignored: the builder is reachable only on a
+# private overlay network and its address does not belong in a public fork.
+#
+#   ZED_FORK_BUILD_HOST   user@host of the build machine        (required)
+#   ZED_FORK_WEBRTC_DIR   prebuilt WebRTC on the builder        (default below)
+#   ZED_FORK_TAP_DIR      local clone of the Homebrew tap       (default below)
+
+set -euo pipefail
+
+cd "$(dirname "$0")/.."
+REPO_ROOT="$(pwd)"
+
+[ -f .fork-release.env ] && source .fork-release.env
+
+BUILD_HOST="${ZED_FORK_BUILD_HOST:-}"
+WEBRTC_DIR="${ZED_FORK_WEBRTC_DIR:-\$HOME/webrtc-libs/mac-arm64-release}"
+TAP_DIR="${ZED_FORK_TAP_DIR:-$HOME/github/xiaolai/homebrew-tap}"
+
+BRANCH="workspace-tabs-in-title-bar"
+FORK_REMOTE="fork"
+UPSTREAM_REMOTE="origin"
+TARGET_TRIPLE="aarch64-apple-darwin"
+RELEASE_DIR="target/${TARGET_TRIPLE}/release"
+APP_PATH="${REPO_ROOT}/${RELEASE_DIR}/bundle/osx/Zed.app"
+DMG_PATH="${REPO_ROOT}/${RELEASE_DIR}/Zed-aarch64.dmg"
+
+# Settings keys this fork adds. A missing default here is a RUNTIME panic, not a
+# compile error, because the content-to-runtime mapping unwraps. A rebase that
+# drops these hunks therefore passes cargo check and dies on launch.
+FORK_SETTINGS_KEYS=(max_workspace_tabs sidebar_toggle_button notify_on_bell)
+
+die() { echo "error: $*" >&2; exit 1; }
+step() { echo; echo "==> $*"; }
+
+require_build_host() {
+    [ -n "$BUILD_HOST" ] || die "ZED_FORK_BUILD_HOST is unset. Put it in .fork-release.env:
+  echo 'ZED_FORK_BUILD_HOST=user@host' > .fork-release.env"
+}
+
+crate_version() {
+    grep -m1 '^version' crates/zed/Cargo.toml | sed 's/.*"\(.*\)".*/\1/'
+}
+
+fork_version() {
+    # Counted from GitHub, not from local tags: `gh release create` makes the tag
+    # server-side, so a fresh clone has none of them and would keep proposing
+    # fork.1 forever.
+    local version count
+    version=$(crate_version)
+    count=$(gh release list --repo xiaolai/zed --limit 100 --json tagName --jq \
+        "[.[] | select(.tagName | startswith(\"v${version}-fork.\"))] | length")
+    echo "${version}-fork.$((count + 1))"
+}
+
+stage_sync() {
+    step "Fetching ${UPSTREAM_REMOTE} and rebasing ${BRANCH}"
+    git diff --quiet && git diff --cached --quiet \
+        || die "working tree is dirty; commit or stash first"
+
+    git fetch "$UPSTREAM_REMOTE"
+    local before after
+    before=$(git rev-parse HEAD)
+    if ! git rebase "${UPSTREAM_REMOTE}/main"; then
+        die "rebase stopped on a conflict. Resolve it, 'git rebase --continue',
+then re-run this stage. The largest conflict surfaces are
+crates/title_bar/src/title_bar.rs and crates/workspace/src/workspace.rs.
+For Cargo.lock, take upstream's and let cargo regenerate."
+    fi
+    after=$(git rev-parse HEAD)
+    [ "$before" = "$after" ] && echo "already up to date with upstream"
+
+    step "Checking the fork's settings defaults survived the rebase"
+    local missing=0
+    for key in "${FORK_SETTINGS_KEYS[@]}"; do
+        if grep -q "\"${key}\"" assets/settings/default.json; then
+            echo "  ok       ${key}"
+        else
+            echo "  MISSING  ${key}"
+            missing=1
+        fi
+    done
+    [ "$missing" -eq 0 ] || die "a fork setting lost its default in assets/settings/default.json.
+This compiles cleanly and panics at runtime. Restore the hunk before building."
+
+    step "Type-checking before spending 16 minutes on a release build"
+    ./script/clippy
+}
+
+stage_build() {
+    require_build_host
+    step "Pushing ${BRANCH} to the builder"
+    # The builder sets receive.denyCurrentBranch=updateInstead, so this updates
+    # its working tree as well as the ref.
+    git push --no-verify "${BUILD_HOST#*@}:github/zed" "${BRANCH}"
+
+    local local_head remote_head
+    local_head=$(git rev-parse HEAD)
+    remote_head=$(ssh "$BUILD_HOST" 'cd ~/github/zed && git rev-parse HEAD')
+    [ "$local_head" = "$remote_head" ] \
+        || die "builder is at ${remote_head}, expected ${local_head}"
+
+    step "Writing the build wrapper to the builder"
+    # Written every run rather than left on the builder, so the preflight
+    # assertions live in version control instead of only on that machine.
+    ssh "$BUILD_HOST" 'cat > ~/run-zed-bundle.sh' <<WRAPPER
+#!/bin/bash
+export PATH="\$HOME/.cargo/bin:/opt/homebrew/bin:\$PATH"
+export ZED_RELEASE_CHANNEL=stable
+
+# The livekit build script downloads a 1 GB prebuilt WebRTC, and that download
+# has timed out on every machine tried. Point it at a local copy and assert the
+# copy is intact: otherwise this fails ~20 minutes into the build.
+export LK_CUSTOM_WEBRTC="${WEBRTC_DIR}"
+if [ ! -f "\$LK_CUSTOM_WEBRTC/lib/libwebrtc.a" ] || [ ! -d "\$LK_CUSTOM_WEBRTC/include" ]; then
+  echo "WEBRTC_PAYLOAD_BAD: \$LK_CUSTOM_WEBRTC"
+  echo "BUNDLE_EXIT=91"
+  exit 91
+fi
+
+# metal and metallib ship as a separately downloadable Xcode component.
+if ! xcrun -sdk macosx metal --version >/dev/null 2>&1; then
+  echo "METAL_MISSING: run 'xcodebuild -downloadComponent MetalToolchain'"
+  echo "BUNDLE_EXIT=90"
+  exit 90
+fi
+
+cd "\$HOME/github/zed" || exit 2
+rm -rf target/aarch64-apple-darwin/release/dmg \\
+       target/aarch64-apple-darwin/release/bundle/osx \\
+       target/aarch64-apple-darwin/release/Zed-aarch64.dmg
+
+echo "START \$(date '+%F %T') channel=\$ZED_RELEASE_CHANNEL"
+script/bundle-mac
+code=\$?
+echo "BUNDLE_EXIT=\$code"
+echo "END \$(date '+%F %T')"
+exit \$code
+WRAPPER
+
+    step "Building (roughly 16 minutes; polling the log)"
+    ssh "$BUILD_HOST" 'chmod +x ~/run-zed-bundle.sh && nohup bash ~/run-zed-bundle.sh > ~/zed-build.log 2>&1 < /dev/null &'
+    while ! ssh "$BUILD_HOST" 'grep -q BUNDLE_EXIT ~/zed-build.log' 2>/dev/null; do
+        sleep 60
+        printf '.'
+    done
+    echo
+
+    # The wrapper's own exit code is what matters, not ssh's and not a tail's.
+    local bundle_exit
+    bundle_exit=$(ssh "$BUILD_HOST" 'grep -m1 BUNDLE_EXIT ~/zed-build.log | cut -d= -f2')
+    if [ "$bundle_exit" != "0" ]; then
+        ssh "$BUILD_HOST" 'tail -25 ~/zed-build.log' >&2
+        die "remote build failed with BUNDLE_EXIT=${bundle_exit}"
+    fi
+    echo "remote build succeeded"
+}
+
+stage_sign() {
+    require_build_host
+    step "Bringing the bundle back"
+    # ditto, not rsync: it is the only tool that reproduces a macOS bundle
+    # faithfully. The byte comparison catches a truncated transfer, which
+    # otherwise shows up much later as a corrupt artifact.
+    local remote_size local_size
+    remote_size=$(ssh "$BUILD_HOST" "cd ~/github/zed/${RELEASE_DIR}/dmg && rm -f /tmp/Zed.zip && ditto -c -k --keepParent Zed.app /tmp/Zed.zip && stat -f %z /tmp/Zed.zip")
+    scp -q "${BUILD_HOST}:/tmp/Zed.zip" /tmp/Zed.zip
+    local_size=$(stat -f %z /tmp/Zed.zip)
+    [ "$remote_size" = "$local_size" ] \
+        || die "transfer truncated: ${local_size} bytes local vs ${remote_size} remote"
+    echo "transferred ${local_size} bytes intact"
+
+    rm -rf "${RELEASE_DIR}/bundle/osx" "${RELEASE_DIR}/dmg" "$DMG_PATH"
+    mkdir -p "${RELEASE_DIR}/bundle/osx"
+    ditto -x -k /tmp/Zed.zip "${RELEASE_DIR}/bundle/osx"
+    rm -f /tmp/Zed.zip
+
+    step "Signing, notarizing and stapling"
+    ZED_RELEASE_CHANNEL=stable ZED_PREBUILT_APP="$APP_PATH" script/bundle-mac
+
+    step "Verifying against the real artifacts"
+    local signed_app="${REPO_ROOT}/${RELEASE_DIR}/dmg/Zed.app"
+    for artifact in "$signed_app" "$DMG_PATH"; do
+        codesign --verify --deep --strict "$artifact"
+        xcrun stapler validate "$artifact" >/dev/null
+    done
+    # Only one verdict counts. No `|| true` here on purpose: a verification that
+    # cannot fail is not a verification.
+    local app_verdict dmg_verdict
+    app_verdict=$(spctl -a -vvv -t exec "$signed_app" 2>&1)
+    dmg_verdict=$(spctl -a -vvv -t open --context context:primary-signature "$DMG_PATH" 2>&1)
+    for verdict in "$app_verdict" "$dmg_verdict"; do
+        grep -q "source=Notarized Developer ID" <<<"$verdict" \
+            || die "Gatekeeper did not accept the artifact as notarized:
+${verdict}"
+    done
+    echo "both artifacts: accepted, source=Notarized Developer ID"
+}
+
+stage_publish() {
+    [ -f "$DMG_PATH" ] || die "no dmg at ${DMG_PATH}; run the sign stage first"
+    local version tag sha
+    version=$(fork_version)
+    tag="v${version}"
+    sha=$(shasum -a 256 "$DMG_PATH" | cut -d' ' -f1)
+
+    step "Publishing ${tag}"
+    git push --no-verify --force-with-lease "$FORK_REMOTE" "$BRANCH"
+    gh release create "$tag" \
+        --repo xiaolai/zed \
+        --target "$BRANCH" \
+        --title "Zed $(crate_version) (personal fork)" \
+        --notes "Personal fork of Zed for Apple Silicon, signed with a personal Developer ID, notarized and stapled.
+
+Install with \`brew upgrade --cask xiaolai/tap/zed\`." \
+        "$DMG_PATH"
+
+    local uploaded
+    uploaded=$(gh release view "$tag" --repo xiaolai/zed --json assets --jq '.assets[0].size')
+    [ "$uploaded" = "$(stat -f %z "$DMG_PATH")" ] \
+        || die "release asset is ${uploaded} bytes, local dmg is $(stat -f %z "$DMG_PATH")"
+
+    step "Bumping the cask"
+    [ -d "$TAP_DIR" ] || die "no tap clone at ${TAP_DIR}"
+    (
+        cd "$TAP_DIR"
+        git pull -q --rebase origin main
+        /usr/bin/sed -i '' \
+            -e "s|^  version \".*\"|  version \"${version}\"|" \
+            -e "s|^  sha256 \".*\"|  sha256 \"${sha}\"|" \
+            Casks/zed.rb
+        ruby -c Casks/zed.rb >/dev/null
+        grep -q "\"${version}\"" Casks/zed.rb || exit 1
+        grep -q "\"${sha}\"" Casks/zed.rb || exit 1
+        git commit -q -am "Update zed to ${version}"
+        git push -q origin main
+    ) || die "failed to update the cask in ${TAP_DIR}"
+
+    echo
+    echo "Published ${tag}. Install it with:"
+    echo "  brew update && brew upgrade --cask xiaolai/tap/zed"
+}
+
+case "${1:-}" in
+    sync)    stage_sync ;;
+    build)   stage_build ;;
+    sign)    stage_sign ;;
+    publish) stage_publish ;;
+    all)     stage_sync; stage_build; stage_sign; stage_publish ;;
+    *)       sed -n '3,25p' "$0" | sed 's|^# \{0,1\}||'; exit 1 ;;
+esac
