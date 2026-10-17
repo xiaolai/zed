@@ -8,6 +8,7 @@
 #
 #   script/fork-release sync      rebase onto upstream and check the result
 #   script/fork-release build     compile on the remote builder
+#   script/fork-release test      run the fork's crate tests on the builder
 #   script/fork-release sign      bring the bundle back, sign, notarize, staple
 #   script/fork-release publish   push the branch, cut a release, bump the cask
 #   script/fork-release all       every stage in order
@@ -178,6 +179,79 @@ WRAPPER
     echo "remote build succeeded"
 }
 
+# Crates this fork modifies. Upstream's full suite is not this fork's to own.
+FORK_TEST_CRATES=(title_bar workspace terminal_view settings settings_content)
+
+stage_test() {
+    require_build_host
+    # Tests run on the builder because a local release-profile run has been
+    # OOM-killed, and run there against the commit `build` already pushed
+    # rather than pushing again, so a green run cannot describe other code.
+    local local_head remote_head
+    local_head=$(git rev-parse HEAD)
+    remote_head=$(ssh "$BUILD_HOST" 'cd ~/github/zed && git rev-parse HEAD')
+    [ "$local_head" = "$remote_head" ] \
+        || die "builder is at ${remote_head}, expected ${local_head}. Run 'build' first."
+
+    step "Writing the test wrapper to the builder"
+    ssh "$BUILD_HOST" 'cat > ~/run-zed-tests.sh' <<WRAPPER
+#!/bin/bash
+export PATH="\$HOME/.cargo/bin:/opt/homebrew/bin:\$PATH"
+[ -f "\$HOME/.cargo/env" ] && . "\$HOME/.cargo/env"
+
+# A non-login ssh shell has had no cargo on PATH, and the resulting 127 is
+# easily misread as a test result.
+if ! command -v cargo >/dev/null; then
+  echo "CARGO_MISSING"
+  echo "TEST_EXIT=127"
+  exit 127
+fi
+
+# macOS defaults this to 256, which is too low for these suites' parallelism:
+# tests fail on EMFILE while opening settings JSON, which reads as ~19 code
+# defects. Raised and then asserted, so a silent failure to raise cannot
+# masquerade as that same breakage again.
+ulimit -n 65536 2>/dev/null
+fd_limit=\$(ulimit -n)
+if [ "\$fd_limit" -lt 8192 ]; then
+  echo "FD_LIMIT_TOO_LOW: \$fd_limit"
+  echo "TEST_EXIT=92"
+  exit 92
+fi
+echo "FD_LIMIT=\$fd_limit"
+
+cd "\$HOME/github/zed" || exit 2
+
+# Deliberately NOT --release. gpui's debug_selector is compiled to a no-op
+# without debug_assertions (crates/gpui/src/elements/div.rs), so every
+# debug_bounds lookup returns None and ~12 layout tests fail in release for
+# reasons that have nothing to do with the code under test.
+echo "START \$(date '+%F %T')"
+cargo test ${FORK_TEST_CRATES[@]/#/-p } --lib
+code=\$?
+echo "TEST_EXIT=\$code"
+echo "END \$(date '+%F %T')"
+exit \$code
+WRAPPER
+
+    step "Testing ${FORK_TEST_CRATES[*]} (polling the log)"
+    ssh "$BUILD_HOST" 'chmod +x ~/run-zed-tests.sh && nohup bash ~/run-zed-tests.sh > ~/zed-test.log 2>&1 < /dev/null &'
+    while ! ssh "$BUILD_HOST" 'grep -q TEST_EXIT ~/zed-test.log' 2>/dev/null; do
+        sleep 30
+        printf '.'
+    done
+    echo
+
+    # The wrapper's own exit code is what matters, not ssh's and not a tail's.
+    local test_exit
+    test_exit=$(ssh "$BUILD_HOST" 'grep -m1 TEST_EXIT ~/zed-test.log | cut -d= -f2')
+    if [ "$test_exit" != "0" ]; then
+        ssh "$BUILD_HOST" 'tail -40 ~/zed-test.log' >&2
+        die "remote tests failed with TEST_EXIT=${test_exit}"
+    fi
+    ssh "$BUILD_HOST" 'grep -h "^test result:" ~/zed-test.log'
+}
+
 stage_sign() {
     require_build_host
     step "Bringing the bundle back"
@@ -278,8 +352,9 @@ Install with \`brew upgrade --cask xiaolai/tap/zed\`." \
 case "${1:-}" in
     sync)    stage_sync ;;
     build)   stage_build ;;
+    test)    stage_test ;;
     sign)    stage_sign ;;
     publish) stage_publish ;;
-    all)     stage_sync; stage_build; stage_sign; stage_publish ;;
+    all)     stage_sync; stage_build; stage_test; stage_sign; stage_publish ;;
     *)       sed -n '3,25p' "$0" | sed 's|^# \{0,1\}||'; exit 1 ;;
 esac
